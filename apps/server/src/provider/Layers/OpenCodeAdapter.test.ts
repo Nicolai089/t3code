@@ -19,6 +19,7 @@ import {
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  type ProviderRuntimeEvent,
   ThreadId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -61,6 +62,7 @@ const runtimeMock = {
     sessionCreateInputs: [] as Array<Record<string, unknown>>,
     authHeaders: [] as Array<string | null>,
     abortCalls: [] as string[],
+    permissionReplyCalls: [] as Array<{ requestID: string; reply: string }>,
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptCalls: [] as Array<unknown>,
@@ -68,6 +70,7 @@ const runtimeMock = {
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
+    subscribedEventGate: null as Promise<void> | null,
     sessionGetIds: [] as string[],
     missingSessionIds: new Set<string>(),
     transientErrorSessionIds: new Set<string>(),
@@ -81,6 +84,7 @@ const runtimeMock = {
     this.state.sessionCreateInputs.length = 0;
     this.state.authHeaders.length = 0;
     this.state.abortCalls.length = 0;
+    this.state.permissionReplyCalls.length = 0;
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptCalls.length = 0;
@@ -88,6 +92,7 @@ const runtimeMock = {
     this.state.closeError = null;
     this.state.messages = [];
     this.state.subscribedEvents = [];
+    this.state.subscribedEventGate = null;
     this.state.sessionGetIds.length = 0;
     this.state.missingSessionIds.clear();
     this.state.transientErrorSessionIds.clear();
@@ -206,11 +211,20 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       event: {
         subscribe: async () => ({
           stream: (async function* () {
+            if (runtimeMock.state.subscribedEventGate) {
+              await runtimeMock.state.subscribedEventGate;
+            }
             for (const event of runtimeMock.state.subscribedEvents) {
               yield event;
             }
           })(),
         }),
+      },
+      permission: {
+        reply: async ({ requestID, reply }: { requestID: string; reply: string }) => {
+          runtimeMock.state.permissionReplyCalls.push({ requestID, reply });
+          return { data: true };
+        },
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -1147,6 +1161,349 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (completed?.type === "item.completed") {
         NodeAssert.equal(completed.payload.detail, "A BBonus");
       }
+    }),
+  );
+
+  it.effect("maps OpenCode child sessions into agent lifecycle and approval events", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-subagent");
+      const rootSessionId = "http://127.0.0.1:9999/session";
+      const childSessionId = "ses_child_explore";
+      const taskMetadata = {
+        parentSessionId: rootSessionId,
+        sessionId: childSessionId,
+        model: { providerID: "openai", modelID: "gpt-5.6-sol" },
+      };
+      const taskInput = {
+        description: "Inspect rollback simulator",
+        prompt: "Read the code and report evidence.",
+        subagent_type: "explore",
+      };
+
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "session.created",
+          properties: {
+            sessionID: childSessionId,
+            info: {
+              id: childSessionId,
+              parentID: rootSessionId,
+              title: "Inspect rollback simulator (@explore subagent)",
+              agent: "explore",
+              model: { providerID: "openai", id: "gpt-5.6-sol", variant: "xhigh" },
+              time: { created: 1, updated: 1 },
+            },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootSessionId,
+            time: 2,
+            part: {
+              id: "part-task",
+              sessionID: rootSessionId,
+              messageID: "msg-root",
+              type: "tool",
+              tool: "task",
+              callID: "call-task",
+              state: {
+                status: "running",
+                input: taskInput,
+                title: "Inspect rollback simulator",
+                metadata: taskMetadata,
+                time: { start: 2 },
+              },
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: childSessionId,
+            info: { id: "msg-child", role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childSessionId,
+            time: 3,
+            part: {
+              id: "part-read",
+              sessionID: childSessionId,
+              messageID: "msg-child",
+              type: "tool",
+              tool: "read",
+              callID: "call-read",
+              state: {
+                status: "running",
+                input: { filePath: "C:\\repo\\engine.as" },
+                title: "Read engine.as",
+                time: { start: 3 },
+              },
+            },
+          },
+        },
+        {
+          type: "permission.asked",
+          properties: {
+            id: "per-child-read",
+            sessionID: childSessionId,
+            permission: "external_directory",
+            patterns: ["C:\\repo\\*"],
+            metadata: {},
+            always: ["C:\\repo\\*"],
+          },
+        },
+        {
+          type: "permission.replied",
+          properties: {
+            sessionID: childSessionId,
+            requestID: "per-child-read",
+            reply: "always",
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childSessionId,
+            time: 4,
+            part: {
+              id: "part-read",
+              sessionID: childSessionId,
+              messageID: "msg-child",
+              type: "tool",
+              tool: "read",
+              callID: "call-read",
+              state: {
+                status: "completed",
+                input: { filePath: "C:\\repo\\engine.as" },
+                output: "source",
+                title: "Read engine.as",
+                metadata: {},
+                time: { start: 3, end: 4 },
+              },
+            },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childSessionId,
+            time: 5,
+            part: {
+              id: "part-child-text",
+              sessionID: childSessionId,
+              messageID: "msg-child",
+              type: "text",
+              text: "The rollback API is network-coupled.",
+              time: { start: 4, end: 5 },
+            },
+          },
+        },
+        {
+          type: "session.status",
+          properties: { sessionID: childSessionId, status: { type: "idle" } },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: rootSessionId,
+            time: 6,
+            part: {
+              id: "part-task",
+              sessionID: rootSessionId,
+              messageID: "msg-root",
+              type: "tool",
+              tool: "task",
+              callID: "call-task",
+              state: {
+                status: "completed",
+                input: taskInput,
+                output: "Verdict: not a side-effect-free simulator.",
+                title: "Inspect rollback simulator",
+                metadata: taskMetadata,
+                time: { start: 2, end: 6 },
+              },
+            },
+          },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+      const started = events.find((event) => event.type === "task.started");
+      NodeAssert.ok(started);
+      if (started.type === "task.started") {
+        NodeAssert.equal(started.payload.taskId, childSessionId);
+        NodeAssert.equal(started.payload.title, "Inspect rollback simulator");
+        NodeAssert.equal(started.payload.role, "explore");
+        NodeAssert.equal(started.payload.model, "openai/gpt-5.6-sol");
+        NodeAssert.equal(started.payload.effort, "xhigh");
+      }
+
+      const childTool = events.find(
+        (event) => event.type === "item.updated" && event.itemId === "call-read",
+      );
+      NodeAssert.ok(childTool);
+      if (childTool.type === "item.updated") {
+        NodeAssert.equal(childTool.payload.agentId, childSessionId);
+        NodeAssert.equal(childTool.payload.parentToolUseId, "call-task");
+      }
+      NodeAssert.equal(
+        events.some((event) => event.type === "content.delta"),
+        false,
+        "child text must not leak into the parent assistant message",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "per-child-read", reply: "always" },
+      ]);
+      NodeAssert.equal(
+        events.some((event) => event.type === "task.updated" && event.payload.status === "waiting"),
+        true,
+      );
+      const completed = events.find((event) => event.type === "task.completed");
+      NodeAssert.ok(completed);
+      if (completed.type === "task.completed") {
+        NodeAssert.equal(completed.payload.taskId, childSessionId);
+        NodeAssert.equal(completed.payload.status, "completed");
+        NodeAssert.equal(completed.payload.summary, "Verdict: not a side-effect-free simulator.");
+        NodeAssert.equal(completed.payload.toolUseId, "call-task");
+      }
+    }),
+  );
+
+  it.effect("completes the active turn when OpenCode emits session.idle", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-session-idle");
+      const rootSessionId = "http://127.0.0.1:9999/session";
+      let releaseEvents: (() => void) | undefined;
+      runtimeMock.state.subscribedEventGate = new Promise<void>((resolve) => {
+        releaseEvents = resolve;
+      });
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "session.idle",
+          properties: { sessionID: rootSessionId },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Finish this turn",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "openai/gpt-5.6-sol",
+        ),
+      });
+      NodeAssert.ok(releaseEvents);
+      releaseEvents();
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+
+      NodeAssert.equal(
+        events.some(
+          (event) =>
+            event.type === "turn.completed" &&
+            event.turnId === turn.turnId &&
+            event.payload.state === "completed",
+        ),
+        true,
+      );
+      const sessions = yield* adapter.listSessions();
+      NodeAssert.equal(sessions[0]?.status, "ready");
+      NodeAssert.equal(sessions[0]?.activeTurnId, undefined);
+    }),
+  );
+
+  it.effect("interrupts live OpenCode child sessions and clears the active turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-subagent-stop");
+      const rootSessionId = "http://127.0.0.1:9999/session";
+      const childSessionId = "ses_child_stop";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "session.created",
+          properties: {
+            sessionID: childSessionId,
+            info: {
+              id: childSessionId,
+              parentID: rootSessionId,
+              title: "Long review (@explore subagent)",
+              agent: "explore",
+              time: { created: 1, updated: 1 },
+            },
+          },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* advanceTestClock(10);
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Start the review",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "openai/gpt-5.6-sol",
+        ),
+      });
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(rootSessionId), true);
+      NodeAssert.equal(runtimeMock.state.abortCalls.includes(childSessionId), true);
+      NodeAssert.equal(
+        events.some(
+          (event) =>
+            event.type === "task.completed" &&
+            event.payload.taskId === childSessionId &&
+            event.payload.status === "stopped",
+        ),
+        true,
+      );
+      NodeAssert.equal(
+        events.some((event) => event.type === "turn.aborted"),
+        true,
+      );
+      const sessions = yield* adapter.listSessions();
+      NodeAssert.equal(sessions[0]?.status, "ready");
+      NodeAssert.equal(sessions[0]?.activeTurnId, undefined);
     }),
   );
 
