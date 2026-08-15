@@ -14,7 +14,7 @@ import {
   ProjectionThreadRepository,
   type ProjectionThreadRepositoryShape,
 } from "../Services/ProjectionThreads.ts";
-import { ModelSelection } from "@t3tools/contracts";
+import { ModelSelection, ThreadId } from "@t3tools/contracts";
 
 const ProjectionThreadDbRow = ProjectionThread.mapFields(
   Struct.assign({
@@ -22,6 +22,7 @@ const ProjectionThreadDbRow = ProjectionThread.mapFields(
   }),
 );
 type ProjectionThreadDbRow = typeof ProjectionThreadDbRow.Type;
+const ProjectionThreadIdRow = Schema.Struct({ threadId: ThreadId });
 
 const makeProjectionThreadRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -186,6 +187,18 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
       `,
   });
 
+  const listProjectionThreadIdsWithPendingUserInput = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionThreadIdRow,
+    execute: () =>
+      sql`
+        SELECT thread_id AS "threadId"
+        FROM projection_threads
+        WHERE pending_user_input_count > 0
+        ORDER BY created_at ASC, thread_id ASC
+      `,
+  });
+
   const deleteProjectionThreadRow = SqlSchema.void({
     Request: DeleteProjectionThreadInput,
     execute: ({ threadId }) =>
@@ -210,6 +223,15 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
       Effect.mapError(toPersistenceSqlError("ProjectionThreadRepository.listByProjectId:query")),
     );
 
+  const listIdsWithPendingUserInput: ProjectionThreadRepositoryShape["listIdsWithPendingUserInput"] =
+    () =>
+      listProjectionThreadIdsWithPendingUserInput().pipe(
+        Effect.mapError(
+          toPersistenceSqlError("ProjectionThreadRepository.listIdsWithPendingUserInput:query"),
+        ),
+        Effect.map((rows) => rows.map((row) => row.threadId)),
+      );
+
   const deleteById: ProjectionThreadRepositoryShape["deleteById"] = (input) =>
     deleteProjectionThreadRow(input).pipe(
       Effect.mapError(toPersistenceSqlError("ProjectionThreadRepository.deleteById:query")),
@@ -219,6 +241,7 @@ const makeProjectionThreadRepository = Effect.gen(function* () {
     upsert,
     getById,
     listByProjectId,
+    listIdsWithPendingUserInput,
     deleteById,
   } satisfies ProjectionThreadRepositoryShape;
 });

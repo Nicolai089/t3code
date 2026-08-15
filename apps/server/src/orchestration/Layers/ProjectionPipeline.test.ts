@@ -1950,7 +1950,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 
-  it.effect("clears stale pending user input from projected shell summaries", () =>
+  it.effect("clears stale pending user input and repairs older shell summaries", () =>
     Effect.gen(function* () {
       const projectionPipeline = yield* OrchestrationProjectionPipeline;
       const eventStore = yield* OrchestrationEventStore;
@@ -2066,8 +2066,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
             summary: "Provider user input response failed",
             payload: {
               requestId: "user-input-request-stale-1",
-              detail:
-                "Provider adapter request failed (codex) for item/tool/requestUserInput: Unknown pending Codex user input request: user-input-request-stale-1",
+              detail: "No active provider session is bound to this thread.",
             },
             turnId: null,
             createdAt: "2026-02-26T12:35:03.000Z",
@@ -2083,6 +2082,26 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
         WHERE thread_id = 'thread-stale-user-input'
       `;
       assert.deepEqual(threadRows, [{ pendingUserInputCount: 0 }]);
+
+      // Simulate the persisted summary left by an older T3 build. Bootstrap
+      // has no new events to replay, but it must still repair the stale shell
+      // counter from the already-projected request lifecycle.
+      yield* sql`
+        UPDATE projection_threads
+        SET pending_user_input_count = 1
+        WHERE thread_id = 'thread-stale-user-input'
+      `;
+
+      yield* projectionPipeline.bootstrap;
+
+      const repairedThreadRows = yield* sql<{
+        readonly pendingUserInputCount: number;
+      }>`
+        SELECT pending_user_input_count AS "pendingUserInputCount"
+        FROM projection_threads
+        WHERE thread_id = 'thread-stale-user-input'
+      `;
+      assert.deepEqual(repairedThreadRows, [{ pendingUserInputCount: 0 }]);
     }),
   );
 

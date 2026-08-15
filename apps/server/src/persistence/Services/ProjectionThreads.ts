@@ -96,6 +96,17 @@ export interface ProjectionThreadRepositoryShape {
   ) => Effect.Effect<ReadonlyArray<ProjectionThread>, ProjectionRepositoryError>;
 
   /**
+   * List projected threads whose shell still reports pending user input.
+   *
+   * Used during projection bootstrap to repair summary counters produced by
+   * older request-lifecycle rules.
+   */
+  readonly listIdsWithPendingUserInput: () => Effect.Effect<
+    ReadonlyArray<ThreadId>,
+    ProjectionRepositoryError
+  >;
+
+  /**
    * Soft-delete a projected thread row by id.
    */
   readonly deleteById: (

@@ -126,7 +126,8 @@ function isStalePendingApprovalFailureDetail(detail: string | null): boolean {
   return (
     detail.includes("stale pending approval request") ||
     detail.includes("unknown pending approval request") ||
-    detail.includes("unknown pending permission request")
+    detail.includes("unknown pending permission request") ||
+    detail.includes("no active provider session is bound to this thread")
   );
 }
 
@@ -167,7 +168,8 @@ function derivePendingUserInputCountFromActivities(
       (detail.includes("stale pending user-input request") ||
         detail.includes("unknown pending user-input request") ||
         detail.includes("unknown pending user input request") ||
-        detail.includes("unknown pending codex user input request"))
+        detail.includes("unknown pending codex user input request") ||
+        detail.includes("no active provider session is bound to this thread"))
     ) {
       openRequestIds.delete(requestId);
     }
@@ -1707,11 +1709,19 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         ),
       );
 
-    const bootstrap: OrchestrationProjectionPipelineShape["bootstrap"] = Effect.forEach(
-      projectors,
-      bootstrapProjector,
-      { concurrency: 1 },
-    ).pipe(
+    const bootstrap: OrchestrationProjectionPipelineShape["bootstrap"] = Effect.gen(function* () {
+      yield* Effect.forEach(projectors, bootstrapProjector, { concurrency: 1 });
+
+      // Older builds left this shell counter set when a response failed
+      // because its provider session had already disappeared. Recompute only
+      // the affected rows on startup so existing threads self-heal without a
+      // new user turn or a full projection replay.
+      const pendingUserInputThreadIds =
+        yield* projectionThreadRepository.listIdsWithPendingUserInput();
+      yield* Effect.forEach(pendingUserInputThreadIds, refreshThreadShellSummary, {
+        concurrency: 1,
+      });
+    }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
       Effect.provideService(ServerConfig, serverConfig),
