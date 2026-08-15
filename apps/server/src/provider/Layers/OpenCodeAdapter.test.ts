@@ -16,6 +16,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { beforeEach } from "vite-plus/test";
 
 import {
+  ApprovalRequestId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -63,6 +64,26 @@ const runtimeMock = {
     authHeaders: [] as Array<string | null>,
     abortCalls: [] as string[],
     permissionReplyCalls: [] as Array<{ requestID: string; reply: string }>,
+    questionReplyCalls: [] as Array<{ requestID: string; answers: Array<Array<string>> }>,
+    pendingPermissions: [] as Array<{
+      id: string;
+      sessionID: string;
+      permission: string;
+      patterns: Array<string>;
+      metadata: Record<string, unknown>;
+      always: Array<string>;
+    }>,
+    pendingQuestions: [] as Array<{
+      id: string;
+      sessionID: string;
+      questions: Array<{
+        question: string;
+        header: string;
+        options: Array<{ label: string; description: string }>;
+        multiple?: boolean;
+        custom?: boolean;
+      }>;
+    }>,
     closeCalls: [] as string[],
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptCalls: [] as Array<unknown>,
@@ -85,6 +106,9 @@ const runtimeMock = {
     this.state.authHeaders.length = 0;
     this.state.abortCalls.length = 0;
     this.state.permissionReplyCalls.length = 0;
+    this.state.questionReplyCalls.length = 0;
+    this.state.pendingPermissions.length = 0;
+    this.state.pendingQuestions.length = 0;
     this.state.closeCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptCalls.length = 0;
@@ -221,10 +245,28 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         }),
       },
       permission: {
+        list: async () => ({ data: runtimeMock.state.pendingPermissions }),
         reply: async ({ requestID, reply }: { requestID: string; reply: string }) => {
           runtimeMock.state.permissionReplyCalls.push({ requestID, reply });
           return { data: true };
         },
+      },
+      question: {
+        list: async () => ({ data: runtimeMock.state.pendingQuestions }),
+        reply: async ({
+          requestID,
+          answers,
+        }: {
+          requestID: string;
+          answers: Array<Array<string>>;
+        }) => {
+          runtimeMock.state.questionReplyCalls.push({ requestID, answers });
+          runtimeMock.state.pendingQuestions = runtimeMock.state.pendingQuestions.filter(
+            (request) => request.id !== requestID,
+          );
+          return { data: true };
+        },
+        reject: async () => ({ data: true }),
       },
     }) as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
   loadOpenCodeInventory: () =>
@@ -397,6 +439,93 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         schemaVersion: 1,
         sessionId: "ses_persisted",
       });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rehydrates and answers a pending question from a resumed OpenCode session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-resume-question");
+      runtimeMock.state.pendingQuestions.push({
+        id: "que_resume",
+        sessionID: "ses_persisted_question",
+        questions: [
+          {
+            header: "Platform Gate",
+            question: "Is the moving map loaded?",
+            options: [
+              {
+                label: "Moving map loaded",
+                description: "Continue verification.",
+              },
+            ],
+            custom: true,
+          },
+        ],
+      });
+      let releaseEvents: (() => void) | undefined;
+      runtimeMock.state.subscribedEventGate = new Promise<void>((resolve) => {
+        releaseEvents = resolve;
+      });
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "question.replied",
+          properties: {
+            sessionID: "ses_persisted_question",
+            requestID: "que_resume",
+            answers: [["Moving map loaded"]],
+          },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      const session = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "ses_persisted_question",
+        },
+        runtimeMode: "full-access",
+      });
+      yield* advanceTestClock(10);
+
+      const requested = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "user-input.requested" }> =>
+          event.type === "user-input.requested" && event.requestId === "que_resume",
+      );
+      NodeAssert.ok(requested);
+      const questionId = requested.payload.questions[0]?.id;
+      NodeAssert.ok(questionId);
+      NodeAssert.equal(session.status, "running");
+
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make("que_resume"), {
+        [questionId]: "Moving map loaded",
+      });
+      NodeAssert.ok(releaseEvents);
+      releaseEvents();
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+
+      NodeAssert.deepEqual(runtimeMock.state.questionReplyCalls, [
+        {
+          requestID: "que_resume",
+          answers: [["Moving map loaded"]],
+        },
+      ]);
+      NodeAssert.equal(
+        events.filter(
+          (event) => event.type === "user-input.resolved" && event.requestId === "que_resume",
+        ).length,
+        1,
+      );
 
       yield* adapter.stopSession(threadId);
     }),
@@ -1164,6 +1293,53 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("automatically approves root OpenCode permissions in full-access mode", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-root-full-access");
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "permission.asked",
+          properties: {
+            id: "per-root-external-directory",
+            sessionID: "http://127.0.0.1:9999/session",
+            permission: "external_directory",
+            patterns: ["C:\\Users\\Nicolai\\Documents\\brawlhalla-main\\*"],
+            metadata: {},
+            always: ["C:\\Users\\Nicolai\\Documents\\brawlhalla-main\\*"],
+          },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "per-root-external-directory", reply: "always" },
+      ]);
+      NodeAssert.equal(
+        events.filter(
+          (event) =>
+            event.type === "request.resolved" && event.requestId === "per-root-external-directory",
+        ).length,
+        1,
+      );
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("maps OpenCode child sessions into agent lifecycle and approval events", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -1504,6 +1680,72 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const sessions = yield* adapter.listSessions();
       NodeAssert.equal(sessions[0]?.status, "ready");
       NodeAssert.equal(sessions[0]?.activeTurnId, undefined);
+    }),
+  );
+
+  it.effect("resolves pending OpenCode questions when the turn is interrupted", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-question-stop");
+      const rootSessionId = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "question.asked",
+          properties: {
+            id: "que_interrupt",
+            sessionID: rootSessionId,
+            questions: [
+              {
+                header: "Continue",
+                question: "Continue the verification?",
+                options: [
+                  {
+                    label: "Continue",
+                    description: "Keep working.",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ];
+
+      const events: Array<ProviderRuntimeEvent> = [];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.runForEach((event) => Effect.sync(() => events.push(event))),
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* advanceTestClock(10);
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Verify the moving platform",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "openai/gpt-5.6-sol",
+        ),
+      });
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      yield* advanceTestClock(10);
+      yield* Fiber.interrupt(eventsFiber);
+
+      NodeAssert.equal(
+        events.filter(
+          (event) => event.type === "user-input.resolved" && event.requestId === "que_interrupt",
+        ).length,
+        1,
+      );
+      NodeAssert.equal(
+        events.some((event) => event.type === "turn.aborted"),
+        true,
+      );
+
+      yield* adapter.stopSession(threadId);
     }),
   );
 

@@ -291,6 +291,11 @@ interface OpenCodeSessionContext {
   readonly openCodeSessionId: string;
   readonly pendingPermissions: Map<string, PermissionRequest>;
   readonly pendingQuestions: Map<string, QuestionRequest>;
+  /**
+   * Native callbacks can race their SDK response (or a recovery snapshot).
+   * Remember terminal request ids so each canonical lifecycle resolves once.
+   */
+  readonly settledRequestIds: Set<string>;
   readonly messageRoleById: Map<string, "user" | "assistant">;
   readonly partById: Map<string, Part>;
   readonly emittedTextByPartId: Map<string, string>;
@@ -746,7 +751,11 @@ export function makeOpenCodeAdapter(
         // the remaining cleanups.
         yield* Effect.forEach(
           contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+          (context) =>
+            settlePendingRequests(context).pipe(
+              Effect.andThen(stopOpenCodeContext(context)),
+              Effect.ignoreCause,
+            ),
           { concurrency: "unbounded", discard: true },
         );
         // Close the logger AFTER session teardown so any final lifecycle
@@ -775,6 +784,64 @@ export function makeOpenCodeAdapter(
         readonly event: Record<string, unknown>;
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.catchCause(() => Effect.void));
+
+    const settlePendingRequests = Effect.fn("settleOpenCodePendingRequests")(function* (
+      context: OpenCodeSessionContext,
+      options?: {
+        readonly sessionId?: string;
+        readonly raw?: unknown;
+      },
+    ) {
+      const matchesSession = (sessionId: string) =>
+        options?.sessionId === undefined || options.sessionId === sessionId;
+
+      for (const [requestId, request] of context.pendingPermissions) {
+        if (!matchesSession(request.sessionID)) {
+          continue;
+        }
+        context.pendingPermissions.delete(requestId);
+        context.settledRequestIds.add(requestId);
+        const requestTurnId =
+          request.sessionID === context.openCodeSessionId
+            ? context.activeTurnId
+            : context.childTasksBySessionId.get(request.sessionID)?.turnId;
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId: requestTurnId,
+            requestId,
+            raw: options?.raw,
+          })),
+          type: "request.resolved",
+          payload: {
+            requestType: mapPermissionToRequestType(request.permission),
+            decision: "decline",
+          },
+        });
+      }
+
+      for (const [requestId, request] of context.pendingQuestions) {
+        if (!matchesSession(request.sessionID)) {
+          continue;
+        }
+        context.pendingQuestions.delete(requestId);
+        context.settledRequestIds.add(requestId);
+        const requestTurnId =
+          request.sessionID === context.openCodeSessionId
+            ? context.activeTurnId
+            : context.childTasksBySessionId.get(request.sessionID)?.turnId;
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId: requestTurnId,
+            requestId,
+            raw: options?.raw,
+          })),
+          type: "user-input.resolved",
+          payload: { answers: {} },
+        });
+      }
+    });
 
     const childTaskLinkage = (context: OpenCodeSessionContext, task: OpenCodeChildTask) => {
       const owningAgentId =
@@ -922,6 +989,7 @@ export function makeOpenCodeAdapter(
       if (task.terminal) {
         return;
       }
+      yield* settlePendingRequests(context, { sessionId: task.sessionId, raw });
       task.terminal = true;
       const normalizedSummary = trimText(summary);
       yield* emit({
@@ -957,6 +1025,7 @@ export function makeOpenCodeAdapter(
       // run this inside a fiber forked via `Effect.forkIn(context.sessionScope)`;
       // closing that scope triggers the fiber-interrupt finalizer, so any
       // subsequent yield point would unwind and silently drop these emits.
+      yield* settlePendingRequests(context);
       yield* emit({
         ...(yield* buildEventBase({
           threadId: context.session.threadId,
@@ -987,6 +1056,133 @@ export function makeOpenCodeAdapter(
         context.client.session.abort({ sessionID: context.openCodeSessionId }),
       ).pipe(Effect.ignore({ log: true }));
       yield* Scope.close(context.sessionScope, Exit.void);
+    });
+
+    const rehydratePendingRequests = Effect.fn("rehydrateOpenCodePendingRequests")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const [permissions, questions] = yield* Effect.all(
+        [
+          runOpenCodeSdk("permission.list", () => context.client.permission.list()).pipe(
+            Effect.map((response) => response.data ?? []),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not restore pending OpenCode permissions.", {
+                threadId: context.session.threadId,
+                detail: openCodeRuntimeErrorDetail(cause),
+              }).pipe(Effect.as([] as Array<PermissionRequest>)),
+            ),
+          ),
+          runOpenCodeSdk("question.list", () => context.client.question.list()).pipe(
+            Effect.map((response) => response.data ?? []),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not restore pending OpenCode questions.", {
+                threadId: context.session.threadId,
+                detail: openCodeRuntimeErrorDetail(cause),
+              }).pipe(Effect.as([] as Array<QuestionRequest>)),
+            ),
+          ),
+        ],
+        { concurrency: 2 },
+      );
+
+      const rootPermissions = permissions.filter(
+        (request) =>
+          request.sessionID === context.openCodeSessionId &&
+          !context.settledRequestIds.has(request.id),
+      );
+      const rootQuestions = questions.filter(
+        (request) =>
+          request.sessionID === context.openCodeSessionId &&
+          !context.settledRequestIds.has(request.id),
+      );
+      if (rootPermissions.length === 0 && rootQuestions.length === 0) {
+        return;
+      }
+
+      let turnId = context.activeTurnId;
+      if (!turnId) {
+        turnId = TurnId.make(`opencode-recovered-turn-${yield* randomUUIDv4}`);
+        context.activeTurnId = turnId;
+        yield* updateProviderSession(context, {
+          status: "running",
+          activeTurnId: turnId,
+        });
+        yield* emit({
+          ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+          type: "turn.started",
+          payload: context.session.model ? { model: context.session.model } : {},
+        });
+      }
+
+      for (const request of rootPermissions) {
+        if (context.pendingPermissions.has(request.id)) {
+          continue;
+        }
+        context.pendingPermissions.set(request.id, request);
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            requestId: request.id,
+          })),
+          type: "request.opened",
+          payload: {
+            requestType: mapPermissionToRequestType(request.permission),
+            detail: request.patterns.length > 0 ? request.patterns.join("\n") : request.permission,
+            args: request.metadata,
+          },
+        });
+        if (context.session.runtimeMode === "full-access") {
+          const replied = yield* runOpenCodeSdk("permission.reply", () =>
+            context.client.permission.reply({
+              requestID: request.id,
+              reply: "always",
+            }),
+          ).pipe(
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.logWarning("Could not restore a pending OpenCode permission.", {
+                threadId: context.session.threadId,
+                requestId: request.id,
+                detail: openCodeRuntimeErrorDetail(cause),
+              }).pipe(Effect.as(false)),
+            ),
+          );
+          if (replied && context.pendingPermissions.delete(request.id)) {
+            context.settledRequestIds.add(request.id);
+            yield* emit({
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+                requestId: request.id,
+              })),
+              type: "request.resolved",
+              payload: {
+                requestType: mapPermissionToRequestType(request.permission),
+                decision: "acceptForSession",
+              },
+            });
+          }
+        }
+      }
+
+      for (const request of rootQuestions) {
+        if (context.pendingQuestions.has(request.id)) {
+          continue;
+        }
+        context.pendingQuestions.set(request.id, request);
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            requestId: request.id,
+          })),
+          type: "user-input.requested",
+          payload: {
+            questions: normalizeQuestionRequest(request),
+          },
+        });
+      }
     });
 
     /** Emit content.delta and item.completed events for an assistant text part. */
@@ -1156,6 +1352,8 @@ export function makeOpenCodeAdapter(
         case "session.deleted": {
           if (childTask) {
             yield* completeChildTask(context, childTask, "stopped", event, "Session deleted.");
+          } else {
+            yield* emitUnexpectedExit(context, "OpenCode session was deleted.");
           }
           break;
         }
@@ -1344,6 +1542,12 @@ export function makeOpenCodeAdapter(
         }
 
         case "permission.asked": {
+          if (
+            context.pendingPermissions.has(event.properties.id) ||
+            context.settledRequestIds.has(event.properties.id)
+          ) {
+            break;
+          }
           context.pendingPermissions.set(event.properties.id, event.properties);
           if (childTask) {
             yield* updateChildTask(context, childTask, "waiting", event);
@@ -1365,37 +1569,62 @@ export function makeOpenCodeAdapter(
               args: event.properties.metadata,
             },
           });
-          if (childTask && context.session.runtimeMode === "full-access") {
-            yield* runOpenCodeSdk("permission.reply", () =>
+          if (context.session.runtimeMode === "full-access") {
+            const replied = yield* runOpenCodeSdk("permission.reply", () =>
               context.client.permission.reply({
                 requestID: event.properties.id,
                 reply: "always",
               }),
             ).pipe(
+              Effect.as(true),
               Effect.catch((cause) =>
-                buildEventBase({
-                  threadId: context.session.threadId,
-                  turnId,
-                  raw: event,
-                }).pipe(
-                  Effect.flatMap((base) =>
-                    emit({
-                      ...base,
-                      type: "runtime.warning",
-                      payload: {
-                        message: "Could not automatically approve an OpenCode subagent request.",
-                        detail: openCodeRuntimeErrorDetail(cause),
-                      },
-                    }),
-                  ),
-                ),
+                Effect.gen(function* () {
+                  const base = yield* buildEventBase({
+                    threadId: context.session.threadId,
+                    turnId,
+                    raw: event,
+                  });
+                  yield* emit({
+                    ...base,
+                    type: "runtime.warning",
+                    payload: {
+                      message: "Could not automatically approve an OpenCode permission request.",
+                      detail: openCodeRuntimeErrorDetail(cause),
+                    },
+                  });
+                  return false;
+                }),
               ),
             );
+            if (replied && context.pendingPermissions.delete(event.properties.id)) {
+              context.settledRequestIds.add(event.properties.id);
+              yield* emit({
+                ...(yield* buildEventBase({
+                  threadId: context.session.threadId,
+                  turnId,
+                  requestId: event.properties.id,
+                  raw: event,
+                })),
+                type: "request.resolved",
+                payload: {
+                  requestType: mapPermissionToRequestType(event.properties.permission),
+                  decision: "acceptForSession",
+                },
+              });
+              if (childTask) {
+                yield* updateChildTask(context, childTask, "running", event);
+              }
+            }
           }
           break;
         }
 
         case "permission.replied": {
+          const request = context.pendingPermissions.get(event.properties.requestID);
+          context.settledRequestIds.add(event.properties.requestID);
+          if (!request) {
+            break;
+          }
           context.pendingPermissions.delete(event.properties.requestID);
           yield* emit({
             ...(yield* buildEventBase({
@@ -1406,7 +1635,7 @@ export function makeOpenCodeAdapter(
             })),
             type: "request.resolved",
             payload: {
-              requestType: "unknown",
+              requestType: mapPermissionToRequestType(request.permission),
               decision: mapPermissionDecision(event.properties.reply),
             },
           });
@@ -1417,6 +1646,12 @@ export function makeOpenCodeAdapter(
         }
 
         case "question.asked": {
+          if (
+            context.pendingQuestions.has(event.properties.id) ||
+            context.settledRequestIds.has(event.properties.id)
+          ) {
+            break;
+          }
           context.pendingQuestions.set(event.properties.id, event.properties);
           if (childTask) {
             yield* updateChildTask(context, childTask, "waiting", event);
@@ -1438,6 +1673,10 @@ export function makeOpenCodeAdapter(
 
         case "question.replied": {
           const request = context.pendingQuestions.get(event.properties.requestID);
+          context.settledRequestIds.add(event.properties.requestID);
+          if (!request) {
+            break;
+          }
           context.pendingQuestions.delete(event.properties.requestID);
           const answers = Object.fromEntries(
             (request?.questions ?? []).map((question, index) => [
@@ -1462,6 +1701,11 @@ export function makeOpenCodeAdapter(
         }
 
         case "question.rejected": {
+          const request = context.pendingQuestions.get(event.properties.requestID);
+          context.settledRequestIds.add(event.properties.requestID);
+          if (!request) {
+            break;
+          }
           context.pendingQuestions.delete(event.properties.requestID);
           yield* emit({
             ...(yield* buildEventBase({
@@ -1527,6 +1771,10 @@ export function makeOpenCodeAdapter(
           }
 
           if (event.properties.status.type === "idle" && turnId) {
+            yield* settlePendingRequests(context, {
+              sessionId: context.openCodeSessionId,
+              raw: event,
+            });
             context.activeTurnId = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
             yield* emit({
@@ -1548,6 +1796,10 @@ export function makeOpenCodeAdapter(
           if (childTask) {
             yield* updateChildTask(context, childTask, "idle", event);
           } else if (turnId) {
+            yield* settlePendingRequests(context, {
+              sessionId: context.openCodeSessionId,
+              raw: event,
+            });
             context.activeTurnId = undefined;
             yield* updateProviderSession(context, { status: "ready" }, { clearActiveTurnId: true });
             yield* emit({
@@ -1584,6 +1836,15 @@ export function makeOpenCodeAdapter(
             break;
           }
           const activeTurnId = context.activeTurnId;
+          yield* settlePendingRequests(context, { raw: event });
+          const liveChildTasks = [...context.childTasksBySessionId.values()].filter(
+            (task) => !task.terminal,
+          );
+          yield* Effect.forEach(
+            liveChildTasks,
+            (task) => completeChildTask(context, task, "failed", event, message),
+            { discard: true },
+          );
           context.activeTurnId = undefined;
           yield* updateProviderSession(
             context,
@@ -1700,6 +1961,7 @@ export function makeOpenCodeAdapter(
         const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
         const existing = sessions.get(input.threadId);
         if (existing) {
+          yield* settlePendingRequests(existing);
           yield* stopOpenCodeContext(existing);
           sessions.delete(input.threadId);
         }
@@ -1883,6 +2145,7 @@ export function makeOpenCodeAdapter(
           openCodeSessionId: started.openCodeSession.id,
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
+          settledRequestIds: new Set(),
           partById: new Map(),
           emittedTextByPartId: new Map(),
           messageRoleById: new Map(),
@@ -1913,7 +2176,11 @@ export function makeOpenCodeAdapter(
           },
         });
 
-        return session;
+        if (!started.created) {
+          yield* rehydratePendingRequests(context);
+        }
+
+        return context.session;
       },
     );
 
@@ -2063,6 +2330,7 @@ export function makeOpenCodeAdapter(
             ).pipe(Effect.ignore({ log: true })),
           { concurrency: "unbounded", discard: true },
         );
+        yield* settlePendingRequests(context);
         yield* Effect.forEach(
           liveChildTasks,
           (task) =>
@@ -2094,7 +2362,8 @@ export function makeOpenCodeAdapter(
       "respondToRequest",
     )(function* (threadId, requestId, decision) {
       const context = yield* ensureSessionContext(sessions, threadId);
-      if (!context.pendingPermissions.has(requestId)) {
+      const request = context.pendingPermissions.get(requestId);
+      if (!request) {
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "permission.reply",
@@ -2108,6 +2377,24 @@ export function makeOpenCodeAdapter(
           reply: toOpenCodePermissionReply(decision),
         }),
       ).pipe(Effect.mapError(toRequestError));
+
+      if (!context.pendingPermissions.delete(requestId)) {
+        return;
+      }
+      context.settledRequestIds.add(requestId);
+      const childTask = context.childTasksBySessionId.get(request.sessionID);
+      const turnId = childTask?.turnId ?? context.activeTurnId;
+      yield* emit({
+        ...(yield* buildEventBase({ threadId, turnId, requestId })),
+        type: "request.resolved",
+        payload: {
+          requestType: mapPermissionToRequestType(request.permission),
+          decision,
+        },
+      });
+      if (childTask) {
+        yield* updateChildTask(context, childTask, "running", undefined);
+      }
     });
 
     const respondToUserInput: OpenCodeAdapterShape["respondToUserInput"] = Effect.fn(
@@ -2129,6 +2416,21 @@ export function makeOpenCodeAdapter(
           answers: toOpenCodeQuestionAnswers(request, answers),
         }),
       ).pipe(Effect.mapError(toRequestError));
+
+      if (!context.pendingQuestions.delete(requestId)) {
+        return;
+      }
+      context.settledRequestIds.add(requestId);
+      const childTask = context.childTasksBySessionId.get(request.sessionID);
+      const turnId = childTask?.turnId ?? context.activeTurnId;
+      yield* emit({
+        ...(yield* buildEventBase({ threadId, turnId, requestId })),
+        type: "user-input.resolved",
+        payload: { answers },
+      });
+      if (childTask) {
+        yield* updateChildTask(context, childTask, "running", undefined);
+      }
     });
 
     const stopSession: OpenCodeAdapterShape["stopSession"] = Effect.fn("stopSession")(
@@ -2140,6 +2442,7 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
+        yield* settlePendingRequests(context);
         const stopped = yield* stopOpenCodeContext(context);
         sessions.delete(threadId);
         if (!stopped) {
@@ -2224,7 +2527,11 @@ export function makeOpenCodeAdapter(
         // interrupt the sibling fibers. Same pattern as the layer finalizer.
         yield* Effect.forEach(
           contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+          (context) =>
+            settlePendingRequests(context).pipe(
+              Effect.andThen(stopOpenCodeContext(context)),
+              Effect.ignoreCause,
+            ),
           { concurrency: "unbounded", discard: true },
         );
       });

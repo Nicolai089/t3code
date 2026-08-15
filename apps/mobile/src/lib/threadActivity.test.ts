@@ -14,9 +14,11 @@ import {
 import {
   buildPendingUserInputAnswers,
   buildThreadFeed,
+  derivePendingUserInputs,
   deriveThreadFeedPresentation,
   isPendingUserInputOptionSelected,
   setPendingUserInputCustomAnswer,
+  sortThreadActivities,
   togglePendingUserInputOptionSelection,
   type ThreadFeedActivity,
   type ThreadFeedEntry,
@@ -110,6 +112,34 @@ describe("pending user input answers", () => {
         "  Orders  ",
       ),
     ).toBe(false);
+  });
+
+  it("clears a legacy pending prompt after its provider session was lost", () => {
+    const activities = sortThreadActivities([
+      makeActivity({
+        id: EventId.make("user-input-open-lost-session"),
+        createdAt: "2026-08-15T07:38:43.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        payload: {
+          requestId: "que_lost_session",
+          questions: [singleSelectQuestion],
+        },
+      }),
+      makeActivity({
+        id: EventId.make("user-input-failed-lost-session"),
+        createdAt: "2026-08-15T07:58:00.000Z",
+        kind: "provider.user-input.respond.failed",
+        summary: "Provider user input response failed",
+        tone: "error",
+        payload: {
+          requestId: "que_lost_session",
+          detail: "No active provider session is bound to this thread.",
+        },
+      }),
+    ]);
+
+    expect(derivePendingUserInputs(activities)).toEqual([]);
   });
 });
 

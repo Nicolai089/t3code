@@ -346,6 +346,48 @@ describe("derivePendingUserInputs", () => {
 
     expect(derivePendingUserInputs(activities)).toEqual([]);
   });
+
+  it("clears legacy pending prompts after a provider session was lost", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "user-input-open-lost-session",
+        createdAt: "2026-08-15T07:38:43.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        tone: "info",
+        payload: {
+          requestId: "que_lost_session",
+          questions: [
+            {
+              id: "platform_gate",
+              header: "Platform Gate",
+              question: "Is the moving map loaded?",
+              options: [
+                {
+                  label: "Moving map loaded",
+                  description: "Continue verification.",
+                },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      }),
+      makeActivity({
+        id: "user-input-failed-lost-session",
+        createdAt: "2026-08-15T07:58:00.000Z",
+        kind: "provider.user-input.respond.failed",
+        summary: "Provider user input response failed",
+        tone: "error",
+        payload: {
+          requestId: "que_lost_session",
+          detail: "No active provider session is bound to this thread.",
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([]);
+  });
 });
 
 describe("deriveActivePlanState", () => {
